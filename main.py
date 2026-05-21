@@ -13,14 +13,18 @@ import email.header
 import email.utils
 import threading
 import re
+import socket
+import ssl
+import time
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from typing import Optional
+from bs4 import BeautifulSoup
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QComboBox, QSpinBox, QTableWidget,
-    QTableWidgetItem, QHeaderView, QFrame, QSplitter, QTextEdit,
+    QTableWidgetItem, QHeaderView, QFrame, QSplitter, QTextBrowser,
     QProgressBar, QStackedWidget, QScrollArea, QMessageBox, QDialog,
     QFormLayout, QCheckBox, QSlider, QStatusBar, QToolBar, QSizePolicy,
     QAbstractItemView, QMenu, QGraphicsDropShadowEffect, QTabWidget
@@ -394,6 +398,22 @@ class ScannerSignals(QObject):
     error         = Signal(str)
     stats_update  = Signal(dict)
 
+# ─── INTERNET AVAILABILITY CHECK ──────────────────────────────────────────────
+
+def is_internet_available(timeout=5):
+    """
+    Check if internet connection is available.
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+
+        # Google DNS
+        socket.create_connection(("8.8.8.8", 53))
+
+        return True
+
+    except OSError:
+        return False
 
 # ─── EMAIL SCANNER WORKER ────────────────────────────────────────────────────
 class EmailScannerWorker(QThread):
@@ -422,25 +442,72 @@ class EmailScannerWorker(QThread):
         return " ".join(decoded).strip()
 
     def get_body(self, msg):
-        body = ""
-        if msg.is_multipart():
-            for part in msg.walk():
-                ctype = part.get_content_type()
-                disp  = str(part.get("Content-Disposition", ""))
-                if ctype == "text/plain" and "attachment" not in disp:
+
+        text_body = ""
+        html_body = ""
+
+        try:
+
+            if msg.is_multipart():
+
+                for part in msg.walk():
+
+                    content_type = part.get_content_type()
+                    disposition = str(part.get("Content-Disposition", ""))
+
+                    # Skip attachments
+                    if "attachment" in disposition:
+                        continue
+
+                    payload = part.get_payload(decode=True)
+
+                    if not payload:
+                        continue
+
+                    charset = part.get_content_charset() or "utf-8"
+
                     try:
-                        charset = part.get_content_charset() or "utf-8"
-                        body = part.get_payload(decode=True).decode(charset, errors="replace")
-                        break
-                    except Exception:
-                        pass
-        else:
-            try:
-                charset = msg.get_content_charset() or "utf-8"
-                body = msg.get_payload(decode=True).decode(charset, errors="replace")
-            except Exception:
-                body = ""
-        return body[:2000]
+                        decoded = payload.decode(charset, errors="replace")
+                    except:
+                        decoded = payload.decode("utf-8", errors="replace")
+
+                    # Save plain text
+                    if content_type == "text/plain" and not text_body:
+                        text_body = decoded
+
+                    # Save HTML
+                    elif content_type == "text/html" and not html_body:
+                        
+                        soup = BeautifulSoup(decoded, "html.parser")
+
+                        # Remove scripts/styles
+                        for tag in soup(["script", "style", "meta", "head", "title"]):
+                            tag.decompose()
+
+                        html_body = str(soup)
+
+            else:
+
+                payload = msg.get_payload(decode=True)
+
+                if payload:
+
+                    charset = msg.get_content_charset() or "utf-8"
+
+                    decoded = payload.decode(charset, errors="replace")
+
+                    if msg.get_content_type() == "text/html":
+                        html_body = decoded
+                    else:
+                        text_body = decoded
+
+        except Exception as e:
+            text_body = f"Could not decode email body.\n\n{str(e)}"
+
+        return {
+            "text": text_body.strip(),
+            "html": html_body.strip()
+        }
 
     def assign_priority(self, subject, body, sender):
         text = (subject + " " + body[:500] + " " + sender).lower()
@@ -498,6 +565,21 @@ class EmailScannerWorker(QThread):
 
             results = []
             for i, mid in enumerate(reversed(msg_ids)):
+
+                # Stop if internet connection is lost
+                if not is_internet_available():
+                    self.signals.error.emit(
+                        "Internet connection was lost during scanning.\n\n"
+                        "Please reconnect and try again."
+                    )
+
+                    try:
+                        mail.logout()
+                    except:
+                        pass
+
+                    return
+
                 if self._stop:
                     break
 
@@ -510,14 +592,19 @@ class EmailScannerWorker(QThread):
                     msg = email.message_from_bytes(raw)
 
                     subject     = self.decode_header_value(msg.get("Subject", "(No Subject)"))
-                    sender      = self.decode_header_value(msg.get("From", ""))
+                    name, email_addr = email.utils.parseaddr(msg.get("From", ""))
+                    sender = self.decode_header_value(name)
+                    if email_addr:
+                        sender += f" <{email_addr}>"
                     date_str    = msg.get("Date", "")
                     msg_id      = msg.get("Message-ID", str(mid))
                     has_attach  = any(
                         part.get_filename() for part in msg.walk() if part.get_filename()
                     )
-                    body        = self.get_body(msg)
-                    priority    = self.assign_priority(subject, body, sender)
+                    body_data       = self.get_body(msg)
+                    plain_body = body_data["text"]
+                    html_body = body_data["html"]
+                    priority    = self.assign_priority(subject, plain_body, sender)
                     score       = self.compute_score(priority, date_str, has_attach)
 
                     try:
@@ -535,7 +622,8 @@ class EmailScannerWorker(QThread):
                         "priority":    priority,
                         "score":       score,
                         "has_attach":  has_attach,
-                        "body":        body,
+                        "body":        plain_body,
+                        "body_html":   html_body,
                         "read":        False,
                     }
                     results.append(entry)
@@ -555,8 +643,28 @@ class EmailScannerWorker(QThread):
             self.signals.error.emit(f"IMAP Error: {str(e)}\n\nCheck credentials or enable IMAP access in your email settings.")
         except ConnectionRefusedError:
             self.signals.error.emit("Connection refused. Check the IMAP server address and port.")
+        except socket.gaierror:
+            self.signals.error.emit(
+                "Unable to reach the mail server.\n\n"
+                "Please check your internet connection."
+            )
+        except TimeoutError:
+            self.signals.error.emit(
+                "Connection timed out.\n\n"
+                "Your internet may be slow or unstable."
+            )
+        except ConnectionResetError:
+            self.signals.error.emit(
+                "Connection was interrupted during scanning."
+            )
+        except OSError as e:
+            self.signals.error.emit(
+                f"Network error occurred:\n\n{str(e)}"
+            )
         except Exception as e:
-            self.signals.error.emit(f"Unexpected error: {str(e)}")
+            self.signals.error.emit(
+                f"Unexpected error:\n\n{str(e)}"
+            )
 
 
 # ─── CUSTOM WIDGETS ──────────────────────────────────────────────────────────
@@ -1057,7 +1165,8 @@ class EmailDetailPanel(QWidget):
         layout.addWidget(self.header)
 
         # Body
-        self.body_edit = QTextEdit()
+        self.body_edit = QTextBrowser()
+        self.body_edit.setOpenExternalLinks(True)
         self.body_edit.setReadOnly(True)
         self.body_edit.setStyleSheet(f"""
             QTextEdit {{
@@ -1097,7 +1206,19 @@ class EmailDetailPanel(QWidget):
         body = data.get("body", "")
         if not body.strip():
             body = "(No content to preview)"
-        self.body_edit.setPlainText(body)
+        html_body = data.get("body_html", "")
+        plain_body = data.get("body", "")
+
+        if html_body.strip():
+
+            self.body_edit.setHtml(html_body)
+
+        else:
+
+            self.body_edit.setPlainText(
+                plain_body if plain_body.strip()
+                else "(No content to preview)"
+            )
 
 
 # ─── MAIN RESULTS DASHBOARD ──────────────────────────────────────────────────
@@ -1479,6 +1600,16 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(0)
 
     def _start_scan(self, config):
+
+        # Check internet before starting
+        if not is_internet_available():
+            QMessageBox.warning(
+                self,
+                "No Internet Connection",
+                "Please check your internet connection before starting the scan."
+            )
+            return
+    
         if config.get("demo"):
             self.stack.setCurrentIndex(1)
             self.scanning_panel.update_progress(50, "Loading demo data…")
@@ -1518,19 +1649,21 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_error(self, msg):
-        self.stack.setCurrentIndex(0)
-        QMessageBox.critical(self, "Scan Error", msg)
 
-    def _cancel_scan(self):
-        if self._worker:
-            self._worker.stop()
         self.stack.setCurrentIndex(0)
 
-    def closeEvent(self, event):
-        if self._worker and self._worker.isRunning():
-            self._worker.stop()
-            self._worker.wait()
-        event.accept()
+        error_box = QMessageBox(self)
+        error_box.setIcon(QMessageBox.Warning)
+
+        error_box.setWindowTitle("Scan Interrupted")
+
+        error_box.setText("Email scanning could not continue.")
+
+        error_box.setInformativeText(msg)
+
+        error_box.setStandardButtons(QMessageBox.Ok)
+
+        error_box.exec()
 
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
