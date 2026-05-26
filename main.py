@@ -16,21 +16,25 @@ import re
 import socket
 import ssl
 import time
+import base64
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from typing import Optional
 from bs4 import BeautifulSoup
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile
+
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QComboBox, QSpinBox, QTableWidget,
-    QTableWidgetItem, QHeaderView, QFrame, QSplitter, QTextBrowser,
+    QTableWidgetItem, QHeaderView, QFrame, QSplitter,
     QProgressBar, QStackedWidget, QScrollArea, QMessageBox, QDialog,
     QFormLayout, QCheckBox, QSlider, QStatusBar, QToolBar, QSizePolicy,
     QAbstractItemView, QMenu, QGraphicsDropShadowEffect, QTabWidget
 )
 from PySide6.QtCore import (
-    Qt, QThread, QObject, Signal, QTimer, QPropertyAnimation,
+    QUrl, Qt, QThread, QObject, Signal, QTimer, QPropertyAnimation,
     QEasingCurve, QRect, QSize, QPoint, QRunnable, QThreadPool,
     Slot, Property
 )
@@ -440,6 +444,41 @@ class EmailScannerWorker(QThread):
             else:
                 decoded.append(str(part))
         return " ".join(decoded).strip()
+    
+    
+
+    def replace_cid_images(self, html, msg):
+
+        cid_map = {}
+
+        for part in msg.walk():
+
+            content_id = part.get("Content-ID")
+
+            if not content_id:
+                continue
+
+            cid = content_id.strip("<>")
+
+            try:
+                payload = part.get_payload(decode=True)
+
+                if not payload:
+                    continue
+
+                mime = part.get_content_type()
+
+                base64_data = base64.b64encode(payload).decode()
+
+                cid_map[cid] = f"data:{mime};base64,{base64_data}"
+
+            except Exception:
+                continue
+
+        for cid, data_url in cid_map.items():
+            html = html.replace(f"cid:{cid}", data_url)
+
+        return html
 
     def get_body(self, msg):
 
@@ -477,14 +516,28 @@ class EmailScannerWorker(QThread):
 
                     # Save HTML
                     elif content_type == "text/html" and not html_body:
-                        
-                        soup = BeautifulSoup(decoded, "html.parser")
 
-                        # Remove scripts/styles
-                        for tag in soup(["script", "style", "meta", "head", "title"]):
-                            tag.decompose()
+                        # Keep original HTML
+                        # Modern emails break if heavily modified
 
-                        html_body = str(soup)
+                        cleaned_html = re.sub(
+                            r"<script.*?>.*?</script>",
+                            "",
+                            decoded,
+                            flags=re.DOTALL | re.IGNORECASE
+                        )
+
+                        # ← ADD THIS: Strip Content-Security-Policy meta tags.
+                        # Email HTML can embed CSP headers that override WebEngine
+                        # permissions and silently block image loading.
+                        cleaned_html = re.sub(
+                            r'<meta[^>]+http-equiv=["\']Content-Security-Policy["\'][^>]*>',
+                            "",
+                            cleaned_html,
+                            flags=re.IGNORECASE
+                        )
+
+                        html_body = cleaned_html
 
             else:
 
@@ -506,7 +559,8 @@ class EmailScannerWorker(QThread):
 
         return {
             "text": text_body.strip(),
-            "html": html_body.strip()
+           # "html": html_body.strip()
+           "html": text_body.strip()
         }
 
     def assign_priority(self, subject, body, sender):
@@ -581,7 +635,18 @@ class EmailScannerWorker(QThread):
                     return
 
                 if self._stop:
-                    break
+
+                    try:
+                        mail.close()
+                    except:
+                        pass
+
+                    try:
+                        mail.logout()
+                    except:
+                        pass
+
+                    return
 
                 pct = 35 + int((i / total) * 60)
                 self.signals.progress.emit(pct, f"Processing email {i+1} of {total}…")
@@ -604,6 +669,10 @@ class EmailScannerWorker(QThread):
                     body_data       = self.get_body(msg)
                     plain_body = body_data["text"]
                     html_body = body_data["html"]
+                    
+                    if html_body:
+                        html_body = self.replace_cid_images(html_body, msg)
+                    
                     priority    = self.assign_priority(subject, plain_body, sender)
                     score       = self.compute_score(priority, date_str, has_attach)
 
@@ -636,6 +705,11 @@ class EmailScannerWorker(QThread):
             results.sort(key=lambda x: x["score"], reverse=True)
 
             mail.logout()
+
+            # DO NOT EMIT RESULTS AFTER CANCEL
+            if self._stop:
+                return
+
             self.signals.progress.emit(100, f"Done! Scanned {len(results)} emails.")
             self.signals.finished.emit(results)
 
@@ -1012,12 +1086,7 @@ class ConfigPanel(QWidget):
         self.scan_btn.clicked.connect(self._on_scan)
         right_layout.addWidget(self.scan_btn)
 
-        right_layout.addSpacing(16)
-        demo_btn = OutlineButton("  ⚡  Load Demo Data", COLORS["accent_purple"])
-        demo_btn.setMinimumHeight(44)
-        demo_btn.clicked.connect(self._load_demo)
-        right_layout.addWidget(demo_btn)
-
+        
         right_layout.addStretch()
 
         right_scroll.setWidget(right)
@@ -1054,8 +1123,6 @@ class ConfigPanel(QWidget):
         }
         self.scan_requested.emit(cfg)
 
-    def _load_demo(self):
-        self.scan_requested.emit({"demo": True, "days": 7})
 
 
 # ─── SCANNING PROGRESS PANEL ─────────────────────────────────────────────────
@@ -1148,8 +1215,8 @@ class EmailDetailPanel(QWidget):
         h_layout.addWidget(self.subject_lbl)
 
         meta_row = QHBoxLayout()
-        self.sender_lbl  = QLabel("")
-        self.date_lbl    = QLabel("")
+        self.sender_lbl = QLabel("")
+        self.date_lbl = QLabel("")
         self.priority_badge = QLabel("")
 
         for lbl in [self.sender_lbl, self.date_lbl]:
@@ -1164,20 +1231,27 @@ class EmailDetailPanel(QWidget):
 
         layout.addWidget(self.header)
 
-        # Body
-        self.body_edit = QTextBrowser()
-        self.body_edit.setOpenExternalLinks(True)
-        self.body_edit.setReadOnly(True)
-        self.body_edit.setStyleSheet(f"""
-            QTextEdit {{
-                background: {COLORS['bg_secondary']};
-                border: none;
-                color: {COLORS['text_primary']};
-                padding: 24px;
-                font-size: 13px;
-                line-height: 1.8;
-            }}
-        """)
+        # ✅ Create WebEngineView FIRST
+        self.body_edit = QWebEngineView()
+
+        # Apply to the view's page settings (controls rendering behavior)
+        s = self.body_edit.settings()
+        s.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+        s.setAttribute(QWebEngineSettings.AutoLoadImages, True)
+        s.setAttribute(QWebEngineSettings.LocalStorageEnabled, True)
+        s.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+        s.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, True)
+        s.setAttribute(QWebEngineSettings.PluginsEnabled, True)
+
+        # ← ADD THIS: Also apply to the default profile (network layer).
+        # In Qt6, LocalContentCanAccessRemoteUrls must be set at the
+        # profile level to actually allow outbound image requests.
+        profile = QWebEngineProfile.defaultProfile()
+        ps = profile.settings()
+        ps.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+        ps.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, True)
+        ps.setAttribute(QWebEngineSettings.AutoLoadImages, True)
+
         layout.addWidget(self.body_edit, 1)
 
     def show_email(self, data: dict):
@@ -1186,9 +1260,9 @@ class EmailDetailPanel(QWidget):
         self.date_lbl.setText(data.get("date", ""))
 
         priority = data.get("priority", "unknown")
-        color    = PRIORITY_COLORS.get(priority, COLORS["info"])
-        labels   = {"critical": "⚡ CRITICAL", "high": "▲ HIGH",
-                    "medium": "● MEDIUM", "low": "▼ LOW", "unknown": "○ NORMAL"}
+        color = PRIORITY_COLORS.get(priority, COLORS["info"])
+        labels = {"critical": "⚡ CRITICAL", "high": "▲ HIGH",
+                "medium": "● MEDIUM", "low": "▼ LOW", "unknown": "○ NORMAL"}
         self.priority_badge.setText(labels.get(priority, ""))
         self.priority_badge.setStyleSheet(f"""
             QLabel {{
@@ -1203,22 +1277,113 @@ class EmailDetailPanel(QWidget):
             }}
         """)
 
-        body = data.get("body", "")
-        if not body.strip():
-            body = "(No content to preview)"
-        html_body = data.get("body_html", "")
-        plain_body = data.get("body", "")
+        html_body = data.get("body_html", "").strip()
+        plain_body = data.get("body", "").strip()
 
-        if html_body.strip():
+        gmail_style = """<style>
+            * { box-sizing: border-box; }
+            body {
+                font-family: Arial, Helvetica, sans-serif;
+                font-size: 14px;
+                line-height: 1.7;
+                color: #202124;
+                background: #ffffff;
+                margin: 0;
+                padding: 16px;
+            }
+            img { max-width: 100% !important; height: auto; display: inline-block; }
+            table { max-width: 100% !important; border-collapse: collapse; }
+            a { color: #1a73e8; }
+            blockquote {
+                border-left: 4px solid #dadce0;
+                margin: 8px 0;
+                padding: 4px 12px;
+                color: #5f6368;
+            }
+        </style>"""
 
-            self.body_edit.setHtml(html_body)
-
+        if html_body:
+            # Wrap fragment or inject into existing full document
+            if not re.search(r"<html", html_body, re.IGNORECASE):
+                final_html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    {gmail_style}
+    </head>
+    <body>{html_body}</body>
+    </html>"""
+            else:
+                if re.search(r"<head[^>]*>", html_body, re.IGNORECASE):
+                    final_html = re.sub(
+                        r"(<head[^>]*>)",
+                        r"\1" + gmail_style,
+                        html_body, count=1, flags=re.IGNORECASE
+                    )
+                else:
+                    final_html = gmail_style + html_body
         else:
+            import html as html_module
+            escaped = html_module.escape(plain_body or "(No content to preview)")
+            final_html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 14px;
+            line-height: 1.7;
+            color: #202124;
+            background: #ffffff;
+            margin: 0;
+            padding: 24px 28px;
+        }}
+        pre {{
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: inherit;
+            font-size: 14px;
+            margin: 0;
+        }}
+        a {{ color: #1a73e8; }}
+    </style>
+    </head>
+    <body>{escaped}</body>
+    </html>"""
 
-            self.body_edit.setPlainText(
-                plain_body if plain_body.strip()
-                else "(No content to preview)"
-            )
+        # ✅ THE REAL FIX: write to temp file and load via file:// URL
+        # file:// + LocalContentCanAccessRemoteUrls = external images load correctly
+        import tempfile
+        import os
+
+        # Delete previous temp file if exists
+        if hasattr(self, "_tmp_file") and self._tmp_file:
+            try:
+                os.unlink(self._tmp_file)
+            except Exception:
+                pass
+
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".html",
+            mode="w",
+            encoding="utf-8"
+        )
+        tmp.write(final_html)
+        tmp.close()
+        self._tmp_file = tmp.name
+
+        self.body_edit.load(QUrl.fromLocalFile(tmp.name))
+
+    def __del__(self):
+        if hasattr(self, "_tmp_file") and self._tmp_file:
+            try:
+                import os
+                os.unlink(self._tmp_file)
+            except Exception:
+                pass
 
 
 # ─── MAIN RESULTS DASHBOARD ──────────────────────────────────────────────────
@@ -1485,78 +1650,6 @@ class ResultsDashboard(QWidget):
         QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
 
 
-# ─── DEMO DATA ────────────────────────────────────────────────────────────────
-def generate_demo_emails():
-    import random
-    entries = [
-        ("URGENT: Your account has been compromised - immediate action required",
-         "security@banknotify.com", "critical", True,
-         "Dear Customer, We've detected suspicious activity on your account. Please verify your identity immediately to prevent unauthorized access."),
-        ("Interview Confirmation - Senior Software Engineer - TechCorp",
-         "hr@techcorp.com", "high", True,
-         "Dear Candidate, We're pleased to confirm your interview scheduled for next Monday at 10 AM. Please bring two forms of ID."),
-        ("Invoice #INV-2024-0892 Due in 3 Days",
-         "billing@services.io", "high", True,
-         "Please find attached invoice #INV-2024-0892 for $1,250.00 due on the 20th. Late fees apply after the due date."),
-        ("Project deadline reminder: Q4 Report submission",
-         "pm@company.org", "critical", False,
-         "This is a reminder that the Q4 annual report is due in 48 hours. Please ensure all sections are completed."),
-        ("Your weekly digest: Top stories this week",
-         "digest@newsservice.com", "low", False,
-         "Here are the top stories curated for you this week. Click to read more about technology, business, and world news."),
-        ("Re: Contract renewal discussion",
-         "legal@partner.com", "high", True,
-         "Further to our call yesterday, please review the attached updated contract terms. We need a decision by Friday."),
-        ("Password reset request",
-         "noreply@app.com", "high", False,
-         "Someone requested a password reset for your account. If this was you, click the link to create a new password."),
-        ("Team meeting - Thursday 3PM",
-         "manager@company.com", "medium", False,
-         "Hi team, We're meeting Thursday at 3PM to discuss Q1 planning. Agenda attached. Please confirm attendance."),
-        ("50% OFF - Weekend Sale Ends Tonight!",
-         "promo@shop.com", "low", False,
-         "Don't miss our biggest sale of the year! Use code WEEKEND50 for 50% off everything in our store."),
-        ("AWS Bill for October: $342.17",
-         "billing@aws.amazon.com", "medium", True,
-         "Your AWS statement for October is available. Total charges: $342.17. Breakdown: EC2 $180, S3 $62, Lambda $100."),
-        ("GitHub: Action required — Dependabot security alert",
-         "noreply@github.com", "high", False,
-         "A critical vulnerability was found in one of your dependencies. Please review and merge the automated fix PR."),
-        ("LinkedIn: John Smith accepted your connection",
-         "notifications@linkedin.com", "low", False,
-         "Your connection request was accepted. Start a conversation with John Smith to grow your professional network."),
-        ("Flight confirmation: NYC → LON — Dec 15",
-         "bookings@airtravel.com", "medium", True,
-         "Your booking is confirmed. Flight AA101, departing JFK December 15th at 18:45, arriving LHR December 16th at 06:30."),
-        ("RE: Proposal Review — Feedback needed",
-         "client@bigfirm.com", "high", False,
-         "Thanks for sending the proposal. I've reviewed it and have a few questions on sections 3 and 5. Can we schedule a call?"),
-        ("Newsletter: October Tech Roundup",
-         "editor@techdigest.io", "low", False,
-         "This month: AI breakthroughs, new Apple announcements, open-source highlights, and developer tips."),
-    ]
-
-    results = []
-    base = datetime.now()
-    for i, (subj, sender, prio, attach, body) in enumerate(entries):
-        dt = base - timedelta(hours=i * 8 + random.randint(0, 5))
-        score_base = {"critical": 100, "high": 75, "medium": 50, "low": 25}[prio]
-        score = score_base + random.uniform(-5, 10) + (10 if attach else 0)
-        results.append({
-            "id":         str(i),
-            "subject":    subj,
-            "sender":     sender,
-            "date":       dt.strftime("%b %d, %Y  %H:%M"),
-            "raw_date":   "",
-            "priority":   prio,
-            "score":      round(score, 1),
-            "has_attach": attach,
-            "body":       body,
-            "read":       False,
-        })
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results
 
 
 # ─── MAIN WINDOW ──────────────────────────────────────────────────────────────
@@ -1567,6 +1660,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1200, 750)
         self.resize(1440, 880)
         self._worker = None
+        self._scan_cancelled = False
 
         self._build_ui()
         self._apply_styles()
@@ -1599,6 +1693,46 @@ class MainWindow(QMainWindow):
             self._worker.wait()
         self.stack.setCurrentIndex(0)
 
+    def _cancel_scan(self):
+
+        self._scan_cancelled = True
+
+        if self._worker:
+
+            # stop worker
+            self._worker.stop()
+
+            # VERY IMPORTANT
+            # disconnect signals immediately
+            try:
+                self._worker.signals.finished.disconnect()
+            except:
+                pass
+
+            try:
+                self._worker.signals.email_found.disconnect()
+            except:
+                pass
+
+            try:
+                self._worker.signals.progress.disconnect()
+            except:
+                pass
+
+        # clear dashboard completely
+        self.results_panel.table.setRowCount(0)
+        self.results_panel.emails = []
+
+        # reset scan panel
+        self._found_count = 0
+        self.scanning_panel.update_found(0)
+        self.scanning_panel.update_progress(0, "Scan cancelled")
+
+        # go homepage immediately
+        self.stack.setCurrentIndex(0)
+
+        self.statusBar().showMessage("Scan cancelled")   
+
     def _start_scan(self, config):
 
         # Check internet before starting
@@ -1609,12 +1743,10 @@ class MainWindow(QMainWindow):
                 "Please check your internet connection before starting the scan."
             )
             return
+        self._scan_cancelled = False
+        self.results_panel.table.setRowCount(0)
+        self.results_panel.emails = []
     
-        if config.get("demo"):
-            self.stack.setCurrentIndex(1)
-            self.scanning_panel.update_progress(50, "Loading demo data…")
-            QTimer.singleShot(900, self._load_demo)
-            return
 
         self.stack.setCurrentIndex(1)
         self.scanning_panel.update_progress(0, "Starting…")
@@ -1627,10 +1759,6 @@ class MainWindow(QMainWindow):
         self._worker.signals.error.connect(self._on_error)
         self._worker.start()
 
-    def _load_demo(self):
-        emails = generate_demo_emails()
-        self.scanning_panel.update_progress(100, "Demo data loaded!")
-        QTimer.singleShot(600, lambda: self._on_finished(emails))
 
     @Slot(int, str)
     def _on_progress(self, pct, msg):
@@ -1638,11 +1766,20 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_email_found(self, entry):
+
+        if self._scan_cancelled:
+            return
+        
         self._found_count = getattr(self, "_found_count", 0) + 1
         self.scanning_panel.update_found(self._found_count)
 
     @Slot(list)
     def _on_finished(self, emails):
+
+        # Prevent results after cancellation
+        if getattr(self, '_scan_cancelled', False):
+            return
+    
         self.results_panel.load_emails(emails)
         self.stack.setCurrentIndex(2)
         self.statusBar().showMessage(f"Scan complete  •  {len(emails)} emails analyzed")
@@ -1668,6 +1805,9 @@ class MainWindow(QMainWindow):
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 def main():
+    # ✅ Problem 5 fix: MUST be before QApplication
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-web-security --allow-running-insecure-content"
+    
     app = QApplication(sys.argv)
     app.setApplicationName("Email Scanner")
     app.setApplicationVersion("1.0.0")
